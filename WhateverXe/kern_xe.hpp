@@ -218,6 +218,7 @@ private:
 
  static uint8_t *display13SSTPort(void *port);
  static uint8_t *display13PanelBootPort(void *port);
+ static bool display13PanelOnlyClock();
  static bool display13HDMIPort(void *port);
  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
  static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);
