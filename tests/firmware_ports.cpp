@@ -145,9 +145,16 @@ int main(int argc,char **argv){
   auto q=parse(b.data(),b.size(),Family::TigerLake);
   assert(q.panel.valid&&q.panel.lowSwing&&q.panel.hobl&&q.panel.type==n);
  }
+ {
+  // 0xFF (select by EDID PnP ID) falls back to panel type 0, as i915 does
+  // without an OpRegion or PnP match.
+  auto b=panelTable;b[options]=255;
+  auto q=parse(b.data(),b.size(),Family::TigerLake);
+  assert(q.valid()&&q.hdmi(3).hdmi==2&&q.panel.valid&&q.panel.type==0&&q.panel.ddi==0);
+ }
  for(unsigned bad=0;bad<5;++bad) {
   auto b=panelTable;
-  if(bad==0)b[options]=255;
+  if(bad==0)b[options]=254;
   if(bad==1)w16(b,edp-2,211);
   if(bad==2)w16(b,power-2,55);
   if(bad==3)append(b,40,1);
