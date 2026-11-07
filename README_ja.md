@@ -7,9 +7,11 @@
 > このフォークは、48 EUのi5-12450H内蔵eDP構成専用です。VBT、eDPソース、ポートモード、コールドCDCLK、2880幅のアパーチャ修正を含みます。
 > 2880×1880 eDPパネル、60 Hz、Metal 2で確認済みです。WhateverXe Graphics 0.4.0と`-wex-edp-keep-loose`が必要です。
 > 120 Hz、解像度変更、ディスプレイスリープは黒画面になり、再起動が必要です。
+>
+> **ダウンロード:** [WhateverXe 0.7.0 - i5-12450H 48 EU eDP](https://github.com/TigerShota/WhateverXe/releases/tag/v0.7.0-48eu-aperture)
 
 WhateverXeは、WhateverGreenを基に開発した、一部のIntel Xe-LP内蔵GPU向けにAppleのグラフィックスドライバーを適応させるLiluプラグインです。
-[WhateverXe](https://github.com/b00t0x/WhateverXe/releases)と[WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases)は両方とも最新版を使用してください。変更点は[CHANGELOG](CHANGELOG.md)を参照してください。
+[i5-12450H 48 EUビルド](https://github.com/TigerShota/WhateverXe/releases)と[WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases)は両方とも最新版を使用してください。変更点は[CHANGELOG](CHANGELOG.md)を参照してください。
 
 ### i5-12450H 48 EU 動作確認構成
 
@@ -70,7 +72,7 @@ OS別の範囲と表示構成は[動作確認済みの機能と既知の問題](
 
 ## インストール
 
-1. Lilu・`WhateverXe.kext`・[AMFIPass 1.4.1 Mod](https://github.com/b00t0x/WhateverXe-Graphics/blob/main/extras/AMFIPass-v1.4.1-Mod-RELEASE.zip)をOpenCoreに追加し、WEXはLiluの後に設定します。WEXは**RELEASE** ZIPを使用してください。DEBUGは障害調査用です。
+1. Lilu・[最新の48 EUリリース](https://github.com/TigerShota/WhateverXe/releases)の`WhateverXe.kext`・[AMFIPass 1.4.1 Mod](https://github.com/b00t0x/WhateverXe-Graphics/blob/main/extras/AMFIPass-v1.4.1-Mod-RELEASE.zip)をOpenCoreに追加し、WEXはLiluの後に設定します。WEXは**RELEASE** ZIPを使用してください。DEBUGは障害調査用です。
 2. `csr-active-config=03080000`（`0x803`）と、[設定](#設定)を適用します。
 3. 対象macOSを起動して最新版の[WhateverXe Graphics pkg](https://github.com/b00t0x/WhateverXe-Graphics/releases)を導入し、再起動します。[pkgの導入・削除手順](https://github.com/b00t0x/WhateverXe-Graphics/blob/main/README_ja.md#インストール)。
 

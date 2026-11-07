@@ -10,9 +10,11 @@
 > **本分支专用于 i5-12450H（Alder Lake-H / UHD Graphics 48 EU / PCI ID `0x46A3`）内屏 eDP 方案。**
 > 已在 2880×1880 内屏、60 Hz、Metal 2 下验证；必须搭配 WhateverXe Graphics 0.4.0 和 `-wex-edp-keep-loose`。
 > 120 Hz、修改分辨率、显示睡眠会黑屏，需要重启。
+>
+> **Download:** [WhateverXe 0.7.0 - i5-12450H 48 EU eDP](https://github.com/TigerShota/WhateverXe/releases/tag/v0.7.0-48eu-aperture)
 
 WhateverXe is a Lilu plugin, derived from WhateverGreen, that adapts Apple graphics drivers for selected Intel Xe-LP integrated GPUs.
-Use the latest releases of [WhateverXe](https://github.com/b00t0x/WhateverXe/releases) and [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases) together. See [CHANGELOG](CHANGELOG.md) for release notes.
+Use the latest [i5-12450H 48-EU build](https://github.com/TigerShota/WhateverXe/releases) with the upstream [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases) package. See [CHANGELOG](CHANGELOG.md) for release notes.
 
 ### Verified i5-12450H 48-EU configuration
 
@@ -73,7 +75,7 @@ See [tested features and known issues](#tested-features-and-known-issues) for OS
 
 ## Installation
 
-1. Add Lilu, `WhateverXe.kext` and [AMFIPass 1.4.1 Mod](https://github.com/b00t0x/WhateverXe-Graphics/blob/main/extras/AMFIPass-v1.4.1-Mod-RELEASE.zip) to OpenCore, with WEX after Lilu. Use the WEX **RELEASE** ZIP; DEBUG is for troubleshooting.
+1. Add Lilu, `WhateverXe.kext` from the [latest 48-EU release](https://github.com/TigerShota/WhateverXe/releases) and [AMFIPass 1.4.1 Mod](https://github.com/b00t0x/WhateverXe-Graphics/blob/main/extras/AMFIPass-v1.4.1-Mod-RELEASE.zip) to OpenCore, with WEX after Lilu. Use the WEX **RELEASE** ZIP; DEBUG is for troubleshooting.
 2. Set `csr-active-config=03080000` (`0x803`) and apply the [configuration](#configuration).
 3. Boot the target macOS, install the latest [WhateverXe Graphics pkg](https://github.com/b00t0x/WhateverXe-Graphics/releases), then restart. [Package installation and removal](https://github.com/b00t0x/WhateverXe-Graphics#install).
 
