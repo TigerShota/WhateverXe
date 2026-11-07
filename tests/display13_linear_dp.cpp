@@ -76,6 +76,21 @@ int main() {
         assert(r.status==LinearStatus::Success && dpSourceUnchanged(io,boot,pipe,ddi,0,nullptr,true));
         io.regs[0x60540+0x1000*pipe]^=64;assert(!dpSourceUnchanged(io,boot,pipe,ddi,0,nullptr,true));
     }
+    // Firmware eDP may report 6 bpc (width 2) or leave the i915-undefined
+    // CTL2 bit 3 set. Both are accepted for the panel path only.
+    auto six=firmware(0,0,2,true);six.regs[0x60400]|=2U<<20;
+    auto sixBoot=readDisplay(six,true);LinearPlan sixPlan;
+    assert(dpSource(sixBoot,0,0,nullptr,true));
+    assert(!dpSource(sixBoot,0,0,nullptr,false));
+    assert(linearPlan(sixBoot,sixPlan,0,GOPProtocol::EDP)==LinearStatus::Ready);
+    assert(linearPlan(sixBoot,sixPlan,0,GOPProtocol::DP)==LinearStatus::InvalidDPSource);
+    auto ctl2=firmware(0,0,2,true);ctl2.regs[0x60404]=0x8;
+    auto ctl2Boot=readDisplay(ctl2,true);
+    assert(dpSource(ctl2Boot,0,0,nullptr,true));
+    assert(!dpSource(ctl2Boot,0,0,nullptr,false));
+    assert(linearPlan(ctl2Boot,sixPlan,0,GOPProtocol::EDP)==LinearStatus::Ready);
+    ctl2.regs[0x60404]=0x18;
+    assert(!dpSource(readDisplay(ctl2,true),0,0,nullptr,true));
     auto bad=firmware(0,0,4,true);bad.regs[0x60540]=0x80000000;
     auto r=reinitializeLinear(bad,readDisplay(bad,true),true,0,GOPProtocol::DP);
     assert(r.status==LinearStatus::InvalidDPSource && bad.writes.empty());
