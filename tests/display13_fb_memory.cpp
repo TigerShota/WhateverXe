@@ -288,6 +288,10 @@ int main() {
      pipes[2]={};pipes[0].publishedScanout=0;
      assert(!publishedSurface(pipes,binding.framebuffer,0x111000) && publishedSurface(pipes,second,0x222000));}
     assert(apertureRange(qualified.pool,0,0x800000,0x10000000));
+    // 2880-wide eDP apertures are rows*pitch, not a page multiple.
+    assert(apertureRange(qualified.pool,0,2880*1800*4,0x10000000));
+    assert(apertureRange(qualified.pool,0,2880*1880*4,0x10000000));
+    assert(!apertureRange(qualified.pool,0,2880*1880*4+1,0x10000000));
     assert(!apertureRange(qualified.pool,0,0,0x10000000));
     assert(!apertureRange(qualified.pool,1,4096,0x10000000));
     assert(!apertureRange(qualified.pool,0,0x3000001,0x10000000));
