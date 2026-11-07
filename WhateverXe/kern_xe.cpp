@@ -7289,7 +7289,12 @@ bool XE::display13AUXReady(void *port,bool command,bool retained) {
 // wrapDisplay13RegsNeedUpdate). The panel's receiver caps and EDID are seen
 // in the firmware's usual eDP format so the donor's mode set requests it.
 static bool display13EDPKeep() {
- static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-keep") ? 1 : 0;
+ static int v=-1;
+ if(v<0) {
+  const bool loose=checkKernelArgument("-wex-edp-keep-loose");
+  Display13EDPKeep::loose=loose;
+  v=(checkKernelArgument("-wex-edp-keep") || loose) ? 1 : 0;
+ }
  return v==1;
 }
 // WEXEDPKeepFirst / WEXEDPKeep, one record per complete mode set the donor

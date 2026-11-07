@@ -31,6 +31,10 @@ enum Reason : uint32_t {
                   // keeps the firmware's refresh of the same active image)
 };
 constexpr uint32_t Blocking=~uint32_t(Sink|Blanking);
+// -wex-edp-keep-loose: keep the same active image even when the donor's computed
+// lane count or bpc differs from the live firmware link. The donor's same-mode
+// branch only touches the plane/scaler, so those fields are not rewritten.
+inline bool loose=false;
 // Registers in Live/record order: TRANS_DDI_FUNC_CTL, TRANSCONF, then the six
 // timing words and PIPESRC.
 constexpr uint32_t LiveRegisters[]={0x60400,0x70008,0x60000,0x60004,0x60008,0x6000C,0x60010,0x60014,0x6001C};
@@ -57,7 +61,7 @@ inline uint32_t compare(const Live &live,const Wanted &want,uint32_t portLanes) 
     live.source!=want.source)reasons|=Timing;
  for(unsigned i=0;i<6;++i)if(live.timing[i]!=want.timing[i])reasons|=Blanking;
  const auto lanes=((live.func>>1)&7)+1;
- if(lanes!=portLanes || ((want.func>>1)&7)+1!=lanes || ((live.func^want.func)&0x00700000U))reasons|=Format;
+ if(!loose && (lanes!=portLanes || ((want.func>>1)&7)+1!=lanes || ((live.func^want.func)&0x00700000U)))reasons|=Format;
  return reasons;
 }
 // DPCD 0x202..0x204: every active lane CR, EQ and symbol lock, aligned.

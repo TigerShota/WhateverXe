@@ -79,6 +79,9 @@ int main() {
     assert(compare(l,wanted(p),1)==Format);
     params(p,panel,1);assert(compare(l,wanted(p),2)==Format);
     params(p,panel,2,1);assert(compare(l,wanted(p),2)==Format);
+    // -wex-edp-keep-loose records the lane/bpc difference instead of blocking.
+    loose=true;params(p,panel,1);assert(compare(l,wanted(p),1)==0);
+    params(p,panel,2,1);assert(compare(l,wanted(p),2)==0);loose=false;
     // The pipe must be enabled and running.
     {params(p,panel);auto off=l;off.transconf=0x80000000;assert(compare(off,wanted(p),2)==PipeOff);}
     // A stopped or retrained source is not the firmware link any more.
