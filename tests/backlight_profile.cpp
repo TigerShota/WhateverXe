@@ -12,10 +12,11 @@ int main() {
   assert(i ? value>previous : value==0);previous=value;
  }
  assert(previous>65000 && previous<=65535);
- assert(eligible(19,0,65535,true));
- for(unsigned uid=0;uid<256;++uid)assert(eligible(uid,0,65535,true)==(uid==19));
- assert(!eligible(19,0,65535,false));
- assert(!eligible(19,1,65535,true));
- assert(!eligible(19,0,0,true));assert(!eligible(19,0,65536,true));
+ assert(eligible(16,0,65535,true));
+ for(unsigned uid=0;uid<256;++uid)assert(eligible(uid,0,65535,true)==(uid!=0));
+ assert(!eligible(16,0,65535,false));
+ assert(!eligible(0,0,65535,true));
+ assert(!eligible(16,1,65535,true));
+ assert(!eligible(16,0,0,true));assert(!eligible(16,0,65536,true));
  puts("PASS: profile shape, monotonic levels, UID/range/internal eligibility");
 }

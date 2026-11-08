@@ -92,12 +92,27 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
  xe.processKext(patcher,index,address,size);
 }
 bool XeHost::wrapPanelSetDisplay(IOService *panel,IOService *display) {
- // Add only the missing UID-19 profile for an actual internal 16-bit PWM
+ // Add only the missing UID-specific profile for an actual internal 16-bit PWM
  // display. Keep Apple's/custom profiles and the native selection algorithm.
  // No string patch, product-ID list, ACPI path or model-specific table.
  auto provider=panel ? panel->getProvider() : nullptr;
- auto uid=provider ? OSDynamicCast(OSString,provider->getProperty("_UID")) : nullptr;
  auto product=display ? OSDynamicCast(OSNumber,display->getProperty("DisplayProductID")) : nullptr;
+ // AppleIntelPanel::start evaluates the provider's ACPI _UID and formats every
+ // panel key as F<uid><type><product>. The published _UID is normally a string,
+ // so derive the number from it instead of matching one fixed literal.
+ uint32_t uid=0;
+ if(provider) {
+  auto property=provider->getProperty("_UID");
+  if(auto number=OSDynamicCast(OSNumber,property)) {
+   uid=number->unsigned32BitValue();
+  } else if(auto string=OSDynamicCast(OSString,property)) {
+   for(const char *c=string->getCStringNoCopy();c && *c;c++) {
+    if(*c<'0' || *c>'9') { uid=0;break; }
+    uid=uid*10+(*c-'0');
+    if(uid>0xFFFF) { uid=0;break; }
+   }
+  }
+ }
  bool owned=false;
  IOFramebuffer *framebuffer=nullptr;
  for(auto entry=display;entry;entry=entry->getProvider()) {
@@ -114,25 +129,32 @@ bool XeHost::wrapPanelSetDisplay(IOService *panel,IOService *display) {
   framebuffer->getAttributeForConnection(0,'bklt',pwm)==kIOReturnSuccess;
  OSDictionary *heldProfiles=nullptr;
  if(range && uid && product && pwm[1]<=UINT32_MAX && pwm[2]<=UINT32_MAX &&
-    XeBacklightProfile::eligible(uid->isEqualTo("19") ? 19 : 0,pwm[1],pwm[2],internal)) {
-  auto original=OSDynamicCast(OSDictionary,panel->getProperty("ApplePanels"));
-  if(original && !panel->getProperty("ApplePanel")) {
-   char key[32];snprintf(key,sizeof(key),"F19T%04x",product->unsigned32BitValue());
-   if(!original->getObject(key) && !original->getObject("F19")) {
-    auto copy=OSDictionary::withDictionary(original);
-    auto curve=OSData::withBytes(XeBacklightProfile::curve,sizeof(XeBacklightProfile::curve));
-    if(copy && curve && copy->setObject(key,curve) && panel->setProperty("ApplePanels",copy)) {
-     // Native removes ApplePanels before retaining its selected OSData in
-     // ApplePanel. Keep the candidate dictionary alive across that handoff.
-     heldProfiles=copy;
-     panel->setProperty("WhateverXeBacklightProfile",key);
-    }
-    if(curve)curve->release();
-    if(copy && !heldProfiles)copy->release();
+    XeBacklightProfile::eligible(uid,pwm[1],pwm[2],internal) &&
+    !panel->getProperty("ApplePanel")) {
+  const unsigned pid=product->unsigned32BitValue();
+  char key[16];snprintf(key,sizeof(key),"F%uT%04x",uid,pid);
+  char family[8];snprintf(family,sizeof(family),"F%u",uid);
+  auto existing=panel->getProperty("ApplePanels");
+  auto original=OSDynamicCast(OSDictionary,existing);
+  const bool usable=!existing || original;
+  if(usable && (!original || (!original->getObject(key) && !original->getObject(family)))) {
+   // The personality normally supplies ApplePanels, but a panel without any
+   // usable profile may also arrive with it already consumed. Publish a
+   // candidate dictionary either way: the native selector requires the
+   // property to exist before it will look at any key.
+   auto copy=original ? OSDictionary::withDictionary(original) : OSDictionary::withCapacity(4);
+   auto curve=OSData::withBytes(XeBacklightProfile::curve,sizeof(XeBacklightProfile::curve));
+   if(copy && curve && copy->setObject(key,curve) && panel->setProperty("ApplePanels",copy)) {
+    // Native removes ApplePanels before retaining its selected OSData in
+    // ApplePanel. Keep the candidate dictionary alive across that handoff.
+    heldProfiles=copy;
+    panel->setProperty("WhateverXeBacklightProfile",key);
    }
+   if(curve)curve->release();
+   if(copy && !heldProfiles)copy->release();
   }
  }
- uint32_t inputs[]={1,owned,uid && uid->isEqualTo("19"),range ? static_cast<uint32_t>(pwm[1]) : ~0U,
+ uint32_t inputs[]={1,owned,uid,range ? static_cast<uint32_t>(pwm[1]) : ~0U,
   range ? static_cast<uint32_t>(pwm[2]) : 0,0};
  const bool result=FunctionCast(wrapPanelSetDisplay,callbackHost->orgPanelSetDisplay)(panel,display);
  if(heldProfiles)heldProfiles->release();

@@ -1,5 +1,6 @@
-// Generic 16-bit PWM curve from WhateverGreen (BSD-3-Clause), F19Txxxx.
-// PNLF UID 19 selects a software brightness profile, not a panel identity.
+// Generic 16-bit PWM curve from WhateverGreen (BSD-3-Clause), F<uid>Txxxx.
+// The UID comes from the backlight device's ACPI _UID; the profile is a
+// software brightness curve, not a panel identity.
 #pragma once
 #include <stdint.h>
 namespace XeBacklightProfile {
@@ -9,6 +10,6 @@ constexpr uint8_t curve[] = {
  0x31,0xA9,0x44,0x59,0x5E,0x76,0x83,0x11,0xB6,0xC7,0xFF,0x7B
 };
 inline bool eligible(unsigned uid,unsigned minimum,unsigned maximum,bool internal) {
- return internal && uid==19 && minimum==0 && maximum==65535;
+ return internal && uid && minimum==0 && maximum==65535;
 }
 }
