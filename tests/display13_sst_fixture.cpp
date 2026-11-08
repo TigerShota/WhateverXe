@@ -8,6 +8,10 @@
 #include "kern_tgl_combo_signal.hpp"
 #include "kern_vbt.hpp"
 #include "kern_xelp_sst_program.hpp"
+// The production training frontend records diagnostics in WEXTrainDiag; the
+// standalone fixtures compile its function text without that storage.
+#define WEX_TRAIN_SET(f,v) ((void)0)
+#define WEX_TRAIN_PUBLISH() ((void)0)
 // NATIVE_OBJECTS
 std::map<void *,unsigned> objectRefs;
 extern bool locked;

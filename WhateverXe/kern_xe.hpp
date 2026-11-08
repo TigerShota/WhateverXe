@@ -121,6 +121,7 @@ private:
     static bool adlsClockTarget(void *controller,void *port,void *otherPort);
     mach_vm_address_t framebufferClockImage {};
     static bool comboClockTarget(void *,void *,void *);
+    static void display13ComboClockDiagnose(void *,void *,void *,uint32_t,bool,bool,bool);
     static bool comboClockPower(void *,bool);
     static uint32_t comboClockRead(void *,unsigned long);
     static void comboClockWrite(void *,unsigned long,uint32_t);

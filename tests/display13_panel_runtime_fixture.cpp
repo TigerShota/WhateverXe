@@ -9,6 +9,12 @@
 #include <iterator>
 #include <sys/mman.h>
 #include <cstdio>
+// The production wrappers record WEXPanelDiag; the standalone fixture compiles
+// their function text without that storage.
+#define WEX_PANEL_PUBLISH() ((void)0)
+#define WEX_PANEL_SET(f,v) ((void)0)
+#define WEX_PANEL_INC(f) ((void)0)
+#define WEX_PANEL_COPY(f,src,n) ((void)0)
 struct IOMemoryMap {
  std::vector<uint32_t> memory=std::vector<uint32_t>(0x400000);
  uintptr_t getVirtualAddress(){return reinterpret_cast<uintptr_t>(memory.data());}
@@ -91,8 +97,13 @@ int main(int argc,char **argv) {
   assert(XE::wrapDisplay13PanelPower(f.ctl,2)==(fail?kIOReturnNotReady:0));
   f.balanced();assert(calls==1 && f.map.at(0xC2020)==(0x11234|(gate?1U<<29:0)));
   assert(display13FBPower.panelFaulted==fail);
-  if(!fail){assert(!XE::wrapDisplay13PanelPower(f.ctl,0));f.balanced();assert(!f.map.at(0xC7200));}
+  if(!fail){assert(!XE::wrapDisplay13PanelPower(f.ctl,0));f.balanced();assert(!f.map.at(0xC7200));assert(f.map.at(0xC7204)==0x63);}
  }
+ // The trained no-keep power sequence leaves EDP_BLC_ENABLE clear; the wrapper
+ // must restore it and keep every other PP_CONTROL bit donor-owned.
+ {Fixture f;f.map.at(0xC7204)=0x63;
+  assert(!XE::wrapDisplay13PanelPower(f.ctl,2));
+  assert(f.map.at(0xC7204)==0x67);f.balanced();}
  for(unsigned bad=0;bad<10;++bad) {
   Fixture f;auto &c=display13FBPower;
   switch(bad){case 0:mapping=false;break;case 1:f.xe.adlnPlatform=nullptr;break;case 2:c.bridge.state.suspended=true;break;
@@ -110,8 +121,9 @@ int main(int argc,char **argv) {
  }
  assert(XE::display13PanelBrightness(f.ctl,65536)==kIOReturnNotReady);f.balanced();
  f.map.at(0xC8250)=0;XE::display13PanelPWMEnable(f.access);assert(f.map.at(0xC8250)==0xa0000000);f.balanced();
- // The actual adapter's write allowlist must not grant a second PPS owner.
- Display13FBPanelIO io{&f.map};io.write(0xC7204,0);assert(f.map.at(0xC7204)==0x67);
+ // The adapter grants PP_CONTROL so the wrapper can drive EDP_BLC_ENABLE;
+ // unfiltered MMIO stays rejected.
+ Display13FBPanelIO io{&f.map};io.write(0xC7204,0x67);assert(f.map.at(0xC7204)==0x67);
  io.write(0x60400,123);assert(!f.map.at(0x60400));
  if(argc>1) {
   std::ifstream input(argv[1],std::ios::binary);std::vector<char> bytes((std::istreambuf_iterator<char>(input)),{});

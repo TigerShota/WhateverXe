@@ -98,6 +98,15 @@
 #include <libkern/c++/OSSerialize.h>
 #include <libkern/c++/OSData.h>
 
+// WEXTrainDiag is a live-machine diagnostic published to the IORegistry during
+// eDP link-training experiments. Standalone CPU fixtures slice individual
+// functions out of this file, so the record's storage and publisher are only
+// compiled into the real kext.
+#define WEX_TRAIN_DIAG 1
+// WEXPanelDiag is the same kind of record for the panel half of the same
+// experiment: PPS power sequencing, the timing plan and the PWM backlight.
+#define WEX_PANEL_DIAG 1
+
 extern "C" const char version[];
 extern "C" void tglHangPreStopWake(void *,bool,unsigned,unsigned,void *);
 extern "C" __attribute__((naked,used)) void tglHangPreStopBridge() {
@@ -4838,10 +4847,31 @@ static Display13FBSysMem::Result adlnInspectSysMem(IOService *controller,IOServi
     return Display13FBSysMem::inspect(io,layout,slot,stored.pages,stored.count);
 }
 
+// FirstResourceFault above only keeps the initiating failure, so a clock fault
+// that follows a watermark fault is invisible. Keep the first 32 latched faults
+// in arrival order (one 4-word entry each) to see which categories actually
+// fired and in what sequence.
+static uint32_t adlnFaultLog[2+32*4];
+static volatile uint32_t adlnFaultTotal;
+// The ordered log above stops at the first 32 arrivals. Watermark retries alone
+// fill it, so a clock fault that follows them never appears. Count every
+// category and keep its first line/status/sequence, plus the live fault state.
+// version, total, {count,firstLine,firstStatus,firstSeq}*5, then the state tail.
+static uint32_t adlnFaultCategory[28];
+
 // Preserve the initiating display-resource failure, before later power calls
 // report only NotReady. This is a CPU-only snapshot; no new MMIO or retry.
 static void adlnFault(bool &flag,uint32_t line,uint32_t status=UINT32_MAX) {
     auto &c=display13FBPower;uint32_t expected=0;
+    const uint32_t category=&flag==&c.memoryFaulted?1:&flag==&c.watermarkFaulted?2:
+        &flag==&c.dbuf.faulted?3:&flag==&c.bridge.state.faulted?4:&flag==&c.clockFaulted?5:0;
+    const auto total=__sync_add_and_fetch(&adlnFaultTotal,1);
+    if(total<=32) {
+        auto entry=adlnFaultLog+2+4*(total-1);
+        entry[0]=total;entry[1]=line;entry[2]=category;entry[3]=status;
+        adlnFaultLog[0]=1;adlnFaultLog[1]=total>32?32:total;
+        IORegistryEntry::getRegistryRoot()->setProperty("N97FBFaultLog",adlnFaultLog,sizeof(adlnFaultLog));
+    }
     if(__atomic_compare_exchange_n(&c.firstFaultLine,&expected,line,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
         uint64_t r[32] {1,line,status,c.sequence},ticks;
         clock_get_uptime(&ticks);absolutetime_to_nanoseconds(ticks,r+4);
@@ -4860,7 +4890,16 @@ static void adlnFault(bool &flag,uint32_t line,uint32_t status=UINT32_MAX) {
         r[30]=c.bridge.pgRefs[0];r[31]=c.bridge.pgRefs[2];
         IORegistryEntry::getRegistryRoot()->setProperty("N97FBFirstResourceFault",r,sizeof(r));
     }
+    if(category) {
+        auto slot=adlnFaultCategory+2+4*(category-1);
+        if(__sync_add_and_fetch(slot,1)==1) {slot[1]=line;slot[2]=status;slot[3]=static_cast<uint32_t>(c.sequence);}
+    }
     flag=true;
+    adlnFaultCategory[0]=1;adlnFaultCategory[1]=total;
+    adlnFaultCategory[22]=c.clockStopped;adlnFaultCategory[23]=c.clockFaulted;
+    adlnFaultCategory[24]=c.panelFaulted;adlnFaultCategory[25]=c.watermarkFaulted;
+    adlnFaultCategory[26]=c.engineEnabled;adlnFaultCategory[27]=static_cast<uint32_t>(c.clock.status);
+    IORegistryEntry::getRegistryRoot()->setProperty("N97FBCategoryFaults",adlnFaultCategory,sizeof(adlnFaultCategory));
 }
 struct Display13FBIRQIO {
 	uintptr_t base;
@@ -4951,12 +4990,13 @@ struct Display13FBPowerIO {
 	}
 	void delayUs(unsigned us) { IODelay(us); }
 };
-// Panel adapter may touch only PPS readback, PWM and the documented on WA.
-// PPS control itself remains donor-owned; do not broaden the common power IO.
+// Panel adapter may touch only PPS readback, PWM, the documented on WA and
+// PP_CONTROL. Every PP_CONTROL bit except EDP_BLC_ENABLE stays donor-owned; do
+// not broaden the common power IO.
 struct Display13FBPanelIO : Display13FBPowerIO {
  explicit Display13FBPanelIO(IOMemoryMap *m):Display13FBPowerIO{m} {}
  void write(uint32_t r,uint32_t v) {
-  if(r==0xC2020 || r==0xC8250 || r==0xC8258)
+  if(r==0xC2020 || r==0xC7204 || r==0xC8250 || r==0xC8258)
    *reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r)=v;
   else Display13FBPowerIO::write(r,v);
  }
@@ -6836,7 +6876,10 @@ void XE::wrapDisplay13TCEnableClocks(void *controller,void *raw,void *other,uint
     auto config=port && port->getMetaClass()->getClassSize()>=0x580 ? Display13FBMemory::field<uint32_t *>(port,0x548):nullptr;
     if(config && config[0]<3) {
         bool keep=false;
-        if(!comboClockTarget(controller,raw,other) || !comboBeginClock(controller,raw,true,keep,other)) {
+        const bool target=comboClockTarget(controller,raw,other);
+        const bool begun=target && comboBeginClock(controller,raw,true,keep,other);
+        if(!target || !begun) {
+            display13ComboClockDiagnose(controller,raw,other,config[0],true,target,begun);
             adlnFault(c.clockFaulted,__LINE__);return;
         }
         FunctionCast(wrapDisplay13TCEnableClocks,self->orgDisplay13TCEnableClocks)(controller,raw,other,params);
@@ -6877,7 +6920,10 @@ void XE::wrapDisplay13TCDisableClocks(void *controller,void *raw,void *other) {
     if(config && config[0]<3) {
         if((self->adlnOutputWiring.links()&(1U<<config[0])) && self->display13ClockOrderReady && !display13StopTranscoder(raw))return;
         bool keep=false;
-        if(!comboClockTarget(controller,raw,other) || !comboBeginClock(controller,raw,false,keep)) {
+        const bool target=comboClockTarget(controller,raw,other);
+        const bool begun=target && comboBeginClock(controller,raw,false,keep);
+        if(!target || !begun) {
+            display13ComboClockDiagnose(controller,raw,other,config[0],false,target,begun);
             adlnFault(c.clockFaulted,__LINE__);return;
         }
         FunctionCast(wrapDisplay13TCDisableClocks,self->orgDisplay13TCDisableClocks)(controller,raw,keep?raw:nullptr);
@@ -7304,6 +7350,77 @@ static bool display13EDPKeep() {
 //   ddi, pipe, path state (+3644), port lanes (+124), port rate (+128, recorded
 //   only), live TRANS_DDI_FUNC_CTL/TRANSCONF/H,V timings/PIPESRC, requested
 //   TRANS_DDI_FUNC_CTL/timings/PIPESRC, DPCD 0x202..0x207.
+// WEXTrainDiag: diagnostic-only record of the Display13 eDP training path.
+// It exists so a black boot can be read back over SSH/VNC without the driver's
+// own log: stage tells where the wrapper stopped, prepare/framing carry the
+// XELP::SSTProgram verdicts, binding is TGLFBBinding::Status, aux is the last
+// LINK_BW_SET/LANE_COUNT_SET/TRAINING_* write and sink is the last DPCD 0x202
+// read. Nothing here changes behaviour.
+#ifdef WEX_TRAIN_DIAG
+enum : uint32_t {
+ TrainNotCalled=0,TrainNative=1,TrainObject=2,TrainHDMI=3,TrainBinding=4,
+ TrainPrepare=5,TrainNativeFail=6,TrainFraming=7,TrainComplete=8
+};
+struct Display13TrainDiag {
+ uint32_t version,stage,calls,keep;
+ uint32_t ddi,pipe,lanes,rate,state,binding;
+ uint32_t prepareReason,clockBefore,clockWanted,clockAfter,funcBefore,funcWanted,funcAfter,bufferBefore;
+ uint32_t framingBefore,framingWanted,framingAfter,framingFlags;
+ uint32_t nativeResult,lastPattern,nativeCalls;
+ uint32_t auxAddress,auxLength,auxFirst,auxSecond;
+ uint32_t sink[2];
+};
+static Display13TrainDiag display13TrainDiag {1};
+static void display13TrainPublish() {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(root)root->setProperty("WEXTrainDiag",&display13TrainDiag,sizeof(display13TrainDiag));
+}
+#define WEX_TRAIN_PUBLISH() display13TrainPublish()
+#define WEX_TRAIN_SET(f,v) (display13TrainDiag.f=(v))
+#else
+#define WEX_TRAIN_PUBLISH() ((void)0)
+#define WEX_TRAIN_SET(f,v) ((void)0)
+#endif
+// WEXPanelDiag: diagnostic-only record of the Display13 panel sequence that
+// follows a successful link training. stage is the last wrapper entered
+// (PanelStage), capture* display13PanelCapture's verdict, power* the native
+// hwSetPanelPower call and the wrapper's own PG/gate witnesses, pp* the PCH PPS
+// readback taken while that call held PG (0xC7200 to 0xC720C), timing* the
+// delay plan merged into controller+1548, blc* the PCH PWM period, polarity and
+// duty (0xC8250/0xC8258) and modeset* the donor's hwRegsNeedUpdate answer and
+// -wex-edp-keep's overrule. Nothing here changes behaviour.
+#ifdef WEX_PANEL_DIAG
+enum : uint32_t {
+ PanelStageNone=0,PanelStageCapture=1,PanelStageTiming=2,PanelStagePower=3,
+ PanelStageBrightness=4,PanelStagePWM=5,PanelStageModeset=6
+};
+struct Display13PanelDiag {
+ uint32_t version,stage;
+ uint32_t captureCalls,captureOk;
+ uint32_t powerCalls,powerState,powerResult,powerOwned,powerGate,powerRestored,powerOk;
+ uint32_t ppStatus,ppControl,ppOn,ppOff;
+ uint32_t timingCalls,timingApply,timingValid,timingBefore[5],timingAfter[5];
+ uint32_t brightnessCalls,brightness,blcDuty,blcReadback,blcPeriod,blcPolarity;
+ uint32_t pwmCalls,pwmValue,pwmOk;
+ uint32_t modesetCalls,modesetUpdate,modesetKeep;
+ uint32_t faulted,healthy;
+ uint32_t bios[3];
+};
+static Display13PanelDiag display13PanelDiag {1};
+static void display13PanelPublish() {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if(root)root->setProperty("WEXPanelDiag",&display13PanelDiag,sizeof(display13PanelDiag));
+}
+#define WEX_PANEL_PUBLISH() display13PanelPublish()
+#define WEX_PANEL_SET(f,v) (display13PanelDiag.f=(v))
+#define WEX_PANEL_INC(f) ((void)__sync_add_and_fetch(&display13PanelDiag.f,1))
+#define WEX_PANEL_COPY(f,src,n) do{for(unsigned wexPanelI=0;wexPanelI<(n);++wexPanelI)display13PanelDiag.f[wexPanelI]=(src)[wexPanelI];}while(0)
+#else
+#define WEX_PANEL_PUBLISH() ((void)0)
+#define WEX_PANEL_SET(f,v) ((void)0)
+#define WEX_PANEL_INC(f) ((void)0)
+#define WEX_PANEL_COPY(f,src,n) ((void)0)
+#endif
 struct Display13EDPKeepRecord {
  uint32_t version,call,kept,reasons,ddi,pipe,state,portLanes,portRate;
  uint32_t live[9],wanted[8];uint8_t status[8];
@@ -7318,6 +7435,12 @@ uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_
  const auto ddi=complete ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
  const bool panel=ddi<2 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi));IOLockUnlock(c.lock);
  if(!r && complete && panel && display13EDPKeep())Display13EDPKeep::capLinkCaps(address,static_cast<uint8_t *>(data),length);
+#ifdef WEX_TRAIN_DIAG
+ if(!r && complete && address==0x202 && length>=2 && data) {
+  const auto b=static_cast<const uint8_t *>(data);
+  display13TrainDiag.sink[0]=b[0];display13TrainDiag.sink[1]=b[1];
+ }
+#endif
  return r ? r : complete ? 0 : kIOReturnNotReady;
 }
 uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32_t length) {
@@ -7326,6 +7449,13 @@ uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32
  if(!ready)return kIOReturnNotReady;
  const auto r=FunctionCast(wrapDisplay13WriteAUX,callbackXE->orgDisplay13WriteAUX)(port,address,data,length);
  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
+#ifdef WEX_TRAIN_DIAG
+ if(!r && complete && address<=0x103 && address+length>0x100) {
+  const auto b=static_cast<const uint8_t *>(data);
+  display13TrainDiag.auxAddress=address;display13TrainDiag.auxLength=length;
+  display13TrainDiag.auxFirst=b?b[0]:0;display13TrainDiag.auxSecond=(b && length>1)?b[1]:0;
+ }
+#endif
  return r ? r : complete ? 0 : kIOReturnNotReady;
 }
 uint32_t XE::wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag) {
@@ -7483,8 +7613,18 @@ uint32_t XE::wrapDisplay13PortTraining(void *port,void *request) {
 }
 // Deferred native clock writes are per pipe and protected by the display
 // owner lock. The native port disable finishes them before PLL/DDI teardown.
+// A write that cannot be deferred must still reach the hardware: swallowing it
+// leaves TRANS_CLK_SEL stale, and latching a clock fault here would block every
+// later SST/panel reference for the rest of the boot. Report the gate inputs
+// instead of inventing a permanent fault.
 struct Display13DeferredClock {void *port {};uint32_t value {};bool pending {};};
 static Display13DeferredClock display13DeferredClocks[3];
+// version, attempts, deferred, passthrough, first{reg,value,pipe,flags},
+// last{reg,value,pipe,flags}, sst/pipeHeld/pending/topNibble failures,
+// access mismatch, missing port, clockFaulted, clockStopped, pipeHeld ok,
+// sst ok. flags: bit0 sst, bit1 pipeHeld, bit2 already pending,
+// bit3 top nibble clear, bit4 selected, bit5 access match.
+static uint32_t display13DeferClockDiag[24];
 bool XE::display13DeferClock(void *access,uint64_t reg,uint32_t value,uintptr_t caller) {
  auto s=callbackXE;auto &c=display13FBPower;
  if(!s->display13ClockOrderReady || caller!=s->display13DPImage+0x4D990 || !c.lock ||
@@ -7500,12 +7640,29 @@ bool XE::display13DeferClock(void *access,uint64_t reg,uint32_t value,uintptr_t 
  }
  IOLockLock(c.lock);Display13FBPowerIO power{c.map};
  const bool selected=port && access==c.access;
+ bool deferredNow=false;
  if(selected) {
   auto &deferred=display13DeferredClocks[pipe];
-  if(display13SSTPort(port) && c.bridge.pipeHeld(power,pipe) && !deferred.pending && !(value&0xf0000000U))deferred={port,value,true};
-  else adlnFault(c.clockFaulted,__LINE__);
+  const bool sst=display13SSTPort(port)!=nullptr,held=c.bridge.pipeHeld(power,pipe),top=!(value&0xf0000000U);
+  if(sst && held && !deferred.pending && top) {deferred={port,value,true};deferredNow=true;}
+  auto &d=display13DeferClockDiag;
+  d[0]=1;
+  const auto attempts=__sync_add_and_fetch(&d[1],1);
+  const uint32_t flags=(sst?1U:0U)|(held?2U:0U)|(deferred.pending?4U:0U)|(top?8U:0U)|16U|32U;
+  if(attempts==1) {d[4]=static_cast<uint32_t>(reg);d[5]=value;d[6]=pipe;d[7]=flags;}
+  d[8]=static_cast<uint32_t>(reg);d[9]=value;d[10]=pipe;d[11]=flags;
+  if(deferredNow)__sync_add_and_fetch(&d[2],1);
+  else {
+   __sync_add_and_fetch(&d[3],1);
+   if(!sst)++d[12];if(!held)++d[13];if(deferred.pending)++d[14];if(!top)++d[15];
+  }
+  d[16]=access!=c.access;d[17]=!port;d[18]=c.clockFaulted;d[19]=c.clockStopped;
+  d[20]=static_cast<uint32_t>(held);d[21]=static_cast<uint32_t>(sst);
+  IORegistryEntry::getRegistryRoot()->setProperty("N97FBDeferClock",d,sizeof(d));
  }
- IOLockUnlock(c.lock);return selected;
+ IOLockUnlock(c.lock);
+ // False means the native writer still runs, so this register reaches hardware.
+ return deferredNow;
 }
 bool XE::display13StopTranscoder(void *port) {
  auto s=callbackXE;auto &c=display13FBPower;
@@ -7705,11 +7862,14 @@ uint32_t XE::wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphas
 
 uint32_t XE::wrapDisplay13TrainingPattern(void *path,uint32_t pattern) {
  auto s=callbackXE;auto &c=display13FBPower;
- if(!s->adlnOutputWiring.links())return FunctionCast(wrapDisplay13TrainingPattern,s->orgDisplay13TrainingPattern)(path,pattern);
+ WEX_TRAIN_SET(lastPattern,pattern);WEX_TRAIN_SET(keep,display13EDPKeep() ? 1U : 0U);
+ WEX_TRAIN_SET(calls,__sync_add_and_fetch(&display13TrainDiag.calls,1));
+ if(!s->adlnOutputWiring.links()){WEX_TRAIN_SET(stage,TrainNative);WEX_TRAIN_PUBLISH();
+  return FunctionCast(wrapDisplay13TrainingPattern,s->orgDisplay13TrainingPattern)(path,pattern);}
  auto object=static_cast<OSObject *>(path);
- if(!c.lock || !object || object->getMetaClass()->getClassSize()<0x3730)return kIOReturnNotReady;
- if(display13HDMIPort(Display13FBMemory::field<void *>(path,0x3648)))
-  return FunctionCast(wrapDisplay13TrainingPattern,s->orgDisplay13TrainingPattern)(path,pattern);
+ if(!c.lock || !object || object->getMetaClass()->getClassSize()<0x3730){WEX_TRAIN_SET(stage,TrainObject);WEX_TRAIN_PUBLISH();return kIOReturnNotReady;}
+ if(display13HDMIPort(Display13FBMemory::field<void *>(path,0x3648))){WEX_TRAIN_SET(stage,TrainHDMI);WEX_TRAIN_PUBLISH();
+  return FunctionCast(wrapDisplay13TrainingPattern,s->orgDisplay13TrainingPattern)(path,pattern);}
  uint32_t reservedDDI=UINT32_MAX,reservedPipe=UINT32_MAX;
  const bool reserved=display13TrainingPath(path,reservedDDI,reservedPipe);
  // Never hold the nonrecursive power lock over donor training or AUX calls.
@@ -7724,7 +7884,14 @@ uint32_t XE::wrapDisplay13TrainingPattern(void *path,uint32_t pattern) {
    binding.status=TGLFBBinding::Status::Complete;binding.ddi=reservedDDI;binding.pipe=reservedPipe;
   }
   Display13FBPowerIO io{c.map};
-  if(binding.status==TGLFBBinding::Status::Complete && c.bridge.outputHeld(io,binding.ddi,binding.pipe)) {
+  const bool ready=binding.status==TGLFBBinding::Status::Complete && c.bridge.outputHeld(io,binding.ddi,binding.pipe);
+  WEX_TRAIN_SET(binding,static_cast<uint32_t>(binding.status));
+  WEX_TRAIN_SET(ddi,binding.ddi);WEX_TRAIN_SET(pipe,binding.pipe);
+  WEX_TRAIN_SET(state,Display13FBMemory::field<uint32_t>(path,0x3644));
+  if(p){WEX_TRAIN_SET(lanes,Display13FBMemory::field<uint32_t>(p,0x124));
+        WEX_TRAIN_SET(rate,Display13FBMemory::field<uint32_t>(p,0x128));}
+  if(!ready)WEX_TRAIN_SET(stage,TrainBinding);
+  if(ready) {
    Display13FBSSTIO registers{c.map};
    const auto read=[&](uint32_t r){return registers.read(r);};
    const auto write=[&](uint32_t r,uint32_t v){registers.write(r,v);};
@@ -7732,22 +7899,37 @@ uint32_t XE::wrapDisplay13TrainingPattern(void *path,uint32_t pattern) {
     ok=true;
     if(pattern==1) {
      const auto r=XELP::SSTProgram::prepare(read,write,binding.ddi,binding.pipe,Display13FBMemory::field<uint32_t>(p,0x124),true,binding.ddi>=3?binding.ddi+3:binding.ddi+1);
+     WEX_TRAIN_SET(prepareReason,r.reason);WEX_TRAIN_SET(clockBefore,r.clockBefore);
+     WEX_TRAIN_SET(clockWanted,r.clockWanted);WEX_TRAIN_SET(clockAfter,r.clockAfter);
+     WEX_TRAIN_SET(funcBefore,r.funcBefore);WEX_TRAIN_SET(funcWanted,r.funcWanted);
+     WEX_TRAIN_SET(funcAfter,r.funcAfter);WEX_TRAIN_SET(bufferBefore,r.bufferBefore);
      // An already-active, identical route needs no rewrite. Never repair an
      // active neighbor or a failed posting read by falling through to native.
      ok=r.bufferBefore!=UINT32_MAX && r.clockBefore!=UINT32_MAX && r.funcBefore!=UINT32_MAX &&
         (!r.reason || (r.reason==2 && r.clockBefore==r.clockWanted && r.funcBefore==r.funcWanted));
+     if(!ok)WEX_TRAIN_SET(stage,TrainPrepare);
     }
    } else {
     const auto r=XELP::SSTProgram::framing(read,write,binding.pipe,p[0x11A],(s->adlnOutputWiring.panel&(1U<<binding.ddi))!=0,s->tglSinkFramingReady,p[0x118],true);
+    WEX_TRAIN_SET(framingBefore,r.before);WEX_TRAIN_SET(framingWanted,r.wanted);
+    WEX_TRAIN_SET(framingAfter,r.after);
+    WEX_TRAIN_SET(framingFlags,(r.active?1U:0U)|(r.alternate?2U:0U)|(r.ready?4U:0U));
     ok=r.ready && r.after!=UINT32_MAX && !(r.after&0x08000000U) && (!r.active || r.after==r.wanted);
+    if(!ok)WEX_TRAIN_SET(stage,TrainFraming);
    }
   }
   IOLockUnlock(c.lock);return ok;
  };
- if(!program(true))return kIOReturnNotReady;
+ if(!program(true)){WEX_TRAIN_PUBLISH();return kIOReturnNotReady;}
+ WEX_TRAIN_SET(nativeCalls,__sync_add_and_fetch(&display13TrainDiag.nativeCalls,1));
  const auto result=FunctionCast(wrapDisplay13TrainingPattern,s->orgDisplay13TrainingPattern)(path,pattern);
- if(result || pattern>5)return result;
- return program(false)?0:kIOReturnNotReady;
+ WEX_TRAIN_SET(nativeResult,result);
+ if(result){WEX_TRAIN_SET(stage,TrainNativeFail);WEX_TRAIN_PUBLISH();return result;}
+ if(pattern>5){WEX_TRAIN_PUBLISH();return result;}
+ const bool framed=program(false);
+ if(framed)WEX_TRAIN_SET(stage,TrainComplete);
+ WEX_TRAIN_PUBLISH();
+ return framed?0:kIOReturnNotReady;
 }
 
 // -wex-edp-keep (Display13EDPKeep): the donor asks for a complete mode set of
@@ -7764,7 +7946,8 @@ uint32_t XE::wrapDisplay13TrainingPattern(void *path,uint32_t pattern) {
 bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler) {
  auto s=callbackXE;auto &c=display13FBPower;
  const bool update=FunctionCast(wrapDisplay13RegsNeedUpdate,s->orgDisplay13RegsNeedUpdate)(controller,fb,path,params,timing,scaler);
- if(!update || !display13EDPKeep() || !c.lock || !path || !params)return update;
+ WEX_PANEL_INC(modesetCalls);WEX_PANEL_SET(modesetUpdate,update);WEX_PANEL_SET(stage,PanelStageModeset);
+ if(!update || !display13EDPKeep() || !c.lock || !path || !params) {WEX_PANEL_PUBLISH();return update;}
  namespace K=Display13EDPKeep;
  Display13EDPKeepRecord record {};record.version=1;record.call=__sync_add_and_fetch(&display13EDPKeepCalls,1);
  record.ddi=record.pipe=record.state=UINT32_MAX;
@@ -7815,6 +7998,7 @@ bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *
  auto root=IORegistryEntry::getRegistryRoot();
  if(record.call==1)root->setProperty("WEXEDPKeepFirst",&record,sizeof(record));
  root->setProperty("WEXEDPKeep",&record,sizeof(record));
+ WEX_PANEL_SET(modesetKeep,keep);WEX_PANEL_PUBLISH();
  if(keep && record.kept==1)
   SYSLOG("igfx","eDP keep: firmware link kept on DDI %u, pipe A (sink status %02x %02x %02x)",record.ddi,record.status[0],record.status[1],record.status[2]);
  else if(!keep && record.call==1)
@@ -9214,9 +9398,11 @@ void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
 	auto mutex=fb && fb->getMetaClass()->getClassSize()>=0x4B90 ? Display13FBMemory::field<IORecursiveLock *>(fb,0x4220) : nullptr;
 	if(mutex)IORecursiveLockLock(mutex);
 	Display13WM::Latch beforeWM,afterWM;uint64_t wmRecord[6] {};
+	bool attempted=false;
 	IOLockLock(c.lock);
 	if(callbackXE->display13FBClockSetHookReady && controller==c.controller && c.bridge.begun &&
 		!c.bridge.state.faulted && !c.clockFaulted && !c.watermarkFaulted && Display13Power::objectAssociations(c.power,0x80,controller,0xC60)) {
+		attempted=true;
 		Display13FBPowerIO powerIO {c.map};uint32_t active=0;const auto wells=powerIO.read(Display13Power::Driver);
 		bool valid=wells!=UINT32_MAX && (wells&3)==3 && c.bridge.state.refs[0] && !(wells&(1U<<16));
 		for(unsigned pipe=0;pipe<3;++pipe) if(wells&(1U<<(2*(5+pipe)))) {
@@ -9256,7 +9442,10 @@ void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
 			*reinterpret_cast<uint64_t *>(reinterpret_cast<uint8_t *>(controller)+0xE98)=result.after.nativeHz();
 		}
 	}
-	if(result.status!=Display13Clock::ChangeStatus::Complete)adlnFault(c.clockFaulted,__LINE__);
+	// A refused guard is not a clock failure: the guard already excludes an
+	// earlier watermark/bridge fault, so latching here would turn that first
+	// fault into a permanent panel block. Only a real attempt may latch.
+	if(attempted && result.status!=Display13Clock::ChangeStatus::Complete)adlnFault(c.clockFaulted,__LINE__);
 	wmRecord[0]=1;wmRecord[3]=static_cast<uint32_t>(beforeWM.status);wmRecord[4]=static_cast<uint32_t>(afterWM.status);
 	wmRecord[5]=c.pipe[0].watermarkClockHz;
 	IOLockUnlock(c.lock);if(mutex)IORecursiveLockUnlock(mutex);
@@ -9573,6 +9762,7 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 	}
 	auto key=cursor ? "N97FBCursorWMFirstInputs" : "N97FBPrimaryWMFirstInputs";
 	if(!root->getProperty(key))root->setProperty(key,inputs,sizeof(inputs));
+	root->setProperty(cursor ? "N97FBCursorWMLastInputs" : "N97FBPrimaryWMLastInputs",inputs,sizeof(inputs));
 	if(pipe<3) {
 		char property[64];
 		snprintf(property,sizeof(property),"N97FBPipe%u%sWMFirstInputs",pipe,cursor ? "Cursor" : "Primary");
@@ -9779,6 +9969,7 @@ void XE::adlnWMEnable(OSObject *plane,bool arm,bool cursor) {
 	auto key=cursor ? "N97FBCursorWMEnableFirstInputs" : "N97FBPrimaryWMEnableFirstInputs";
 	inputs[21]=static_cast<uint32_t>(r.status);
 	if(!root->getProperty(key))root->setProperty(key,inputs,sizeof(inputs));
+	root->setProperty(cursor ? "N97FBCursorWMEnableLastInputs" : "N97FBPrimaryWMEnableLastInputs",inputs,sizeof(inputs));
 }
 void XE::wrapAlderLakeNPlaneWMEnable(OSObject *plane,bool arm) {adlnWMEnable(plane,arm,false);}
 void XE::wrapDisplay13CursorWMEnable(OSObject *plane,bool arm) {adlnWMEnable(plane,arm,true);}
@@ -10024,7 +10215,12 @@ void XE::display13WMArmUpdate(IOService *fb) {
 		else result.status=Display13WM::Status::Conflict;
 	}
 	c.pipe[pipe].wmLatch=result;c.pipe[pipe].wmCommitting=false;
-	if(result.status!=Display13WM::Status::Complete && result.status!=Display13WM::Status::Unavailable)adlnFault(c.watermarkFaulted,__LINE__);
+	// Status::Input here means nothing was attempted: an unreadable DBUF register
+	// or a plan the CDCLK cannot clock (clockFits). That is a rejected plan, not a
+	// corrupt watermark state, so it must not latch the session-wide fault that
+	// makes every later setup/enable/cursor path bail out.
+	if(result.status!=Display13WM::Status::Complete && result.status!=Display13WM::Status::Unavailable &&
+	   result.status!=Display13WM::Status::Input)adlnFault(c.watermarkFaulted,__LINE__);
 	record[0]=1;record[1]=static_cast<uint32_t>(result.status);record[2]=pending;record[3]=c.pipe[pipe].wmPending;
 	record[4]=result.frameBefore;record[5]=result.frameAfter;record[6]=result.waitUs;record[7]=result.budgetUs;
 	record[8]=result.lastReg;record[9]=result.expected;record[10]=result.observed;
@@ -13388,65 +13584,102 @@ bool XE::display13PanelPowerReference(bool acquire) {
 bool XE::display13PanelCapture(void *controller) {
  auto &c=display13FBPower;if(!c.lock)return false;IOLockLock(c.lock);
  Display13FBPanelIO io{c.map};bool ok=false;
+ WEX_PANEL_INC(captureCalls);WEX_PANEL_SET(stage,PanelStageCapture);
  if(display13PanelTarget(controller) && display13PanelPowerReference(true)) {
   ok=c.panel.capture(io,callbackXE->firmwarePorts.panel);
+  WEX_PANEL_COPY(bios,c.panel.bios,3);
   if(ok)*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE60)=c.panel.pwm.period;
   ok=display13PanelPowerReference(false) && ok;
  }
- IOLockUnlock(c.lock);return ok;
+ WEX_PANEL_SET(captureOk,ok);WEX_PANEL_SET(faulted,c.panelFaulted);
+ WEX_PANEL_SET(healthy,!c.panelFaulted && !c.clockFaulted);
+ IOLockUnlock(c.lock);WEX_PANEL_PUBLISH();return ok;
 }
 void XE::display13PanelTiming(void *controller,bool apply) {
- if(!display13PanelCapture(controller) || !apply)return;
+ if(!display13PanelCapture(controller) || !apply) {
+  WEX_PANEL_SET(stage,PanelStageTiming);WEX_PANEL_SET(timingApply,apply);WEX_PANEL_PUBLISH();return;
+ }
  auto &c=display13FBPower;IOLockLock(c.lock);
+ WEX_PANEL_INC(timingCalls);WEX_PANEL_SET(stage,PanelStageTiming);WEX_PANEL_SET(timingApply,apply);
  if(display13PanelTarget(controller)) {
+  auto *field=static_cast<uint32_t *>(static_cast<void *>(static_cast<uint8_t *>(controller)+0x1548));
+  WEX_PANEL_COPY(timingBefore,field,5);
   const auto plan=XELP::PanelPower::select(callbackXE->firmwarePorts.panel,
    static_cast<uint32_t *>(static_cast<void *>(static_cast<uint8_t *>(controller)+0x1548)),c.panel.bios[0],c.panel.bios[1],c.panel.bios[2]);
   if(plan.valid)memcpy(static_cast<uint8_t *>(controller)+0x1548,plan.fields,sizeof(plan.fields));
   else c.panelFaulted=true;
+  WEX_PANEL_SET(timingValid,plan.valid);WEX_PANEL_COPY(timingAfter,plan.fields,5);
  }
- IOLockUnlock(c.lock);
+ WEX_PANEL_SET(faulted,c.panelFaulted);WEX_PANEL_SET(healthy,!c.panelFaulted && !c.clockFaulted);
+ IOLockUnlock(c.lock);WEX_PANEL_PUBLISH();
 }
 uint32_t XE::display13PanelBrightness(void *controller,uint32_t brightness) {
  if(!display13PanelCapture(controller))return kIOReturnNotReady;
  auto &c=display13FBPower;IOLockLock(c.lock);Display13FBPanelIO io{c.map};bool ok=false;uint32_t duty=0;
+ WEX_PANEL_INC(brightnessCalls);WEX_PANEL_SET(stage,PanelStageBrightness);WEX_PANEL_SET(brightness,brightness);
  if(display13PanelTarget(controller) && c.panel.pwm.duty(brightness,duty) &&
     display13PanelPowerReference(true)) {
-  io.write(0xC8258,duty);ok=io.read(0xC8258)==duty;
+  io.write(0xC8258,duty);const auto readback=io.read(0xC8258);ok=readback==duty;
+  WEX_PANEL_SET(blcDuty,duty);WEX_PANEL_SET(blcReadback,readback);
   if(ok)*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
   ok=display13PanelPowerReference(false) && ok;
  }
- IOLockUnlock(c.lock);return ok?0:kIOReturnNotReady;
+ WEX_PANEL_SET(blcPeriod,c.panel.pwm.period);WEX_PANEL_SET(blcPolarity,c.panel.pwm.polarity);
+ WEX_PANEL_SET(faulted,c.panelFaulted);WEX_PANEL_SET(healthy,!c.panelFaulted && !c.clockFaulted);
+ IOLockUnlock(c.lock);WEX_PANEL_PUBLISH();return ok?0:kIOReturnNotReady;
 }
 void XE::display13PanelPWMEnable(void *access) {
  auto &c=display13FBPower;if(!c.lock)return;IOLockLock(c.lock);Display13FBPanelIO io{c.map};
+ WEX_PANEL_INC(pwmCalls);WEX_PANEL_SET(stage,PanelStagePWM);
  if(access==c.access && display13PanelTarget(c.controller) && c.panel.pwm.valid() &&
     display13PanelPowerReference(true)) {
   const auto value=0x80000000U|c.panel.pwm.polarity;
   io.write(0xC8250,value);const bool ok=io.read(0xC8250)==value;
+  WEX_PANEL_SET(pwmValue,value);WEX_PANEL_SET(pwmOk,ok);
   if(!display13PanelPowerReference(false) || !ok)c.panelFaulted=true;
  }
- IOLockUnlock(c.lock);
+ WEX_PANEL_SET(faulted,c.panelFaulted);WEX_PANEL_SET(healthy,!c.panelFaulted && !c.clockFaulted);
+ IOLockUnlock(c.lock);WEX_PANEL_PUBLISH();
 }
 uint32_t XE::wrapDisplay13PanelPower(void *controller,uint32_t state) {
  auto s=callbackXE;auto &c=display13FBPower;
  if(!s->adlnOutputWiring.panel)return FunctionCast(wrapDisplay13PanelPower,s->orgDisplay13PanelPower)(controller,state);
- if(!c.panelLock || !c.lock || !display13PanelCapture(controller))return kIOReturnNotReady;
+ WEX_PANEL_INC(powerCalls);WEX_PANEL_SET(powerState,state);WEX_PANEL_SET(stage,PanelStagePower);
+ if(!c.panelLock || !c.lock || !display13PanelCapture(controller)) {
+  WEX_PANEL_SET(powerOk,0);WEX_PANEL_PUBLISH();return kIOReturnNotReady;
+ }
  IOLockLock(c.panelLock);IOLockLock(c.lock);Display13FBPanelIO io{c.map};Display13Panel::OnGate gate;
  const bool owned=display13PanelTarget(controller) && display13PanelPowerReference(true);
  const bool ready=owned && (state!=2 || gate.begin(io));
+ WEX_PANEL_SET(powerOwned,owned);WEX_PANEL_SET(powerGate,ready);
  IOLockUnlock(c.lock);
  const auto result=ready?FunctionCast(wrapDisplay13PanelPower,s->orgDisplay13PanelPower)(controller,state):uint32_t(kIOReturnNotReady);
  IOLockLock(c.lock);
+ bool ok=ready;
+ uint32_t pp[4] {UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX};
+ if(owned) {
+  // PCH PPS readback: PP_STATUS, PP_CONTROL and the on/off delay words.
+  pp[0]=io.read(0xC7200);pp[1]=io.read(0xC7204);pp[2]=io.read(0xC7208);pp[3]=io.read(0xC720C);
+  const auto status=pp[0];
+  ok=ok && status!=UINT32_MAX && (state==2 ? (status&0x80000000U)!=0 : !(status&0x80000000U));
+  // Linux intel_pps_backlight_on/off drives EDP_BLC_ENABLE (PP_CONTROL bit2).
+  // The native sequence leaves it clear while PP_STATUS still reports PP_ON, so
+  // the panel scans out with no backlight. Keep all other bits donor-owned.
+  if(ok && pp[1]!=UINT32_MAX) {
+   const auto control=state==2 ? (pp[1]|0x4U) : (pp[1]&~0x4U);
+   if(control!=pp[1]) {io.write(0xC7204,control);pp[1]=io.read(0xC7204);}
+  }
+ }
  // Always restore the workaround before releasing our PG, also after failed on.
  const bool restored=!owned || gate.finish(io);
- bool ok=ready && restored;
- if(owned) {
-  const auto status=io.read(0xC7200);
-  ok=ok && status!=UINT32_MAX && (state==2 ? (status&0x80000000U)!=0 : !(status&0x80000000U));
-  ok=display13PanelPowerReference(false) && ok;
- }
+ ok=ok && restored;
+ if(owned)ok=display13PanelPowerReference(false) && ok;
  if(!ok)c.panelFaulted=true;
- IOLockUnlock(c.lock);IOLockUnlock(c.panelLock);
+ WEX_PANEL_SET(powerResult,result);WEX_PANEL_SET(powerRestored,restored);
+ WEX_PANEL_SET(ppStatus,pp[0]);WEX_PANEL_SET(ppControl,pp[1]);WEX_PANEL_SET(ppOn,pp[2]);WEX_PANEL_SET(ppOff,pp[3]);
+ WEX_PANEL_SET(powerOk,ok);WEX_PANEL_SET(faulted,c.panelFaulted);
+ WEX_PANEL_SET(healthy,!c.panelFaulted && !c.clockFaulted);
+ IOLockUnlock(c.lock);IOLockUnlock(c.panelLock);WEX_PANEL_PUBLISH();
  return ok?result:uint32_t(kIOReturnNotReady);
 }
 
@@ -18727,6 +18960,48 @@ bool XE::comboClockTarget(void *controller,void *port,void *otherPort) {
     return s->tglActive && controller==s->tglObservationController &&
         XELP::displayAdapter(s->xeProfile.family)==XELP::DisplayAdapter::TGL &&
         config==reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(s->tglPlatformCopy)+0x20+24*config[0]);
+}
+
+// comboClockTarget is a pure predicate that standalone fixtures compile on its
+// own, so it cannot publish. Re-derive the same checks here for the Display13
+// combo branch: a rejected clock currently faults permanently with no record of
+// which binding refused it.
+void XE::display13ComboClockDiagnose(void *controller,void *port,void *otherPort,
+                                     uint32_t ddi,bool enabling,bool target,bool begun) {
+    auto s=callbackXE;uint32_t reason=0;
+    auto p=static_cast<uint8_t *>(port),c=static_cast<uint8_t *>(controller);
+    auto config=port?*reinterpret_cast<uint32_t **>(p+0x548):nullptr;
+    auto access=controller?*reinterpret_cast<uint8_t **>(c+0xC40):nullptr;
+    if(!controller)reason|=1U<<0;
+    if(!port)reason|=1U<<1;
+    if(otherPort && otherPort!=port && !comboClockTarget(controller,otherPort,nullptr))reason|=1U<<2;
+    if(!config)reason|=1U<<3;
+    else {
+        if(config[0]>=2)reason|=1U<<4;
+        if(config[3])reason|=1U<<5;
+        if(config[2]>2)reason|=1U<<6;
+    }
+    if(!access)reason|=1U<<7;
+    if(config && access) {
+        if(*reinterpret_cast<void **>(p+0x578)!=access)reason|=1U<<8;
+        if(*reinterpret_cast<uint32_t *>(access+0x60)<0x164294)reason|=1U<<9;
+        if(*reinterpret_cast<uint32_t *>(p+0x5B8)!=(config[0]?0x6C10CU:0x16210CU))reason|=1U<<10;
+    }
+    if(!reason) {
+        if(controller!=s->adlnTopologyController)reason|=1U<<11;
+        if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring))reason|=1U<<12;
+    }
+    if(!target)reason|=1U<<20;
+    if(!begun)reason|=1U<<21;
+    uint32_t record[]={1,reason,enabling?1U:0U,ddi,config?config[0]:UINT32_MAX,
+        config?config[2]:UINT32_MAX,config?config[3]:UINT32_MAX,
+        access?*reinterpret_cast<uint32_t *>(access+0x60):0,
+        config?*reinterpret_cast<uint32_t *>(p+0x5B8):0U,
+        s->display13FramebufferRequested?1U:0U,
+        target?1U:0U,begun?1U:0U};
+    auto root=IORegistryEntry::getRegistryRoot();
+    if(!root->getProperty("WEXDisplay13ComboClockFail"))
+        root->setProperty("WEXDisplay13ComboClockFail",record,sizeof(record));
 }
 
 bool XE::comboClockPower(void *power,bool acquire) {

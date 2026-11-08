@@ -25,7 +25,7 @@ code=code.replace('struct XE {','''struct XE {
 '''.replace('LEASE',lease))
 code=code.replace('static bool display13StopTranscoder(void*){assert(false);return false;}','static bool display13StopTranscoder(void*);')
 code=code.replace('static bool display13TrainingPath(void*,uint32_t&,uint32_t&){return false;}','static bool display13TrainingPath(void*,uint32_t&,uint32_t&);')
-code=code.replace('// FUNCTIONS',re.search(r'struct Display13DeferredClock .*?static Display13DeferredClock display13DeferredClocks\[3\];',s,re.S).group()+'\n'+functions)
+code=code.replace('// FUNCTIONS',re.search(r'struct Display13DeferredClock .*?static uint32_t display13DeferClockDiag\[24\];',s,re.S).group()+'\n'+functions)
 prefix='''#include <mutex>
 #include <cassert>
 #include <cstdint>
@@ -33,6 +33,8 @@ using IORecursiveLock=std::recursive_mutex;
 void IORecursiveLockLock(IORecursiveLock*p){p->lock();}void IORecursiveLockUnlock(IORecursiveLock*p){p->unlock();}
 void *current_thread(){return (void*)1;}unsigned delayUs=0;void IODelay(unsigned n){delayUs+=n;}
 void adlnFault(bool &v,unsigned){v=true;}
+struct IORegistryEntry {static IORegistryEntry *getRegistryRoot();void setProperty(const char*,const void*,unsigned long){}};
+IORegistryEntry *IORegistryEntry::getRegistryRoot(){static IORegistryEntry r;return &r;}
 '''
 extra=r'''
 void *testPort;void *testLookup(void*p){return p==testPort?currentPath:nullptr;}
@@ -56,6 +58,10 @@ int main(){IORecursiveLock pool;
   const auto clock=0x46140+4*pipe;assert(map.regs[clock]==((ddi+(ddi>=3?3:1))<<28));
   assert(!XE::display13DeferClock(f.access,clock,0,state.display13DPImage+0x4d991));
   assert(XE::display13DeferClock(f.access,clock,0,state.display13DPImage+0x4d990));assert(map.regs[clock]==((ddi+(ddi>=3?3:1))<<28));
+  // A write that cannot be queued must fall through to the native writer
+  // instead of being swallowed and latching a permanent clock fault.
+  assert(!XE::display13DeferClock(f.access,clock,0,state.display13DPImage+0x4d990));
+  assert(display13DeferredClocks[pipe].pending&&display13DeferClockDiag[3]&&display13DeferClockDiag[14]);
   map.regs[0x70008+0x1000*pipe]=0;map.regs[0x64000+0x100*ddi]=0x80000000;
   assert(!XE::display13StopTranscoder(f.port)&&map.regs[clock]==((ddi+(ddi>=3?3:1))<<28));
   map.regs[0x64000+0x100*ddi]=0x80;map.regs[0x60540+0x1000*pipe]&=~0x80000000U;

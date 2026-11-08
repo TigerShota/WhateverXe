@@ -100,5 +100,48 @@ inline bool edid8bpc(uint8_t *edid) {
  edid[127]=uint8_t(-sum);
  return true;
 }
+// The panel's DisplayID extension advertises 2880x1800 at 120 Hz and at 48 Hz,
+// both at a 689.49 MHz pixel clock (3040x1890 and 3040x4725 totals). The ADL-N
+// CDCLK table ends at 652.8 MHz, so Display13WM::clockFits rejects either plan
+// and the pipe never latches a scanout. Without -wex-edp-keep the donor picks
+// the 120 Hz mode. Clamp the base block's range limits to 60 Hz and 650 MHz
+// (descriptor tag 0xFD: min/max vertical rate, max pixel clock in 10 MHz), so
+// the mode list stays inside what this display engine can drive.
+inline bool edidRefreshLimit(uint8_t *edid,uint32_t &minV,uint32_t &maxV,uint32_t &maxClock) {
+ static const uint8_t header[]={0,255,255,255,255,255,255,0};
+ if(!edid || __builtin_memcmp(edid,header,sizeof(header)))return false;
+ for(unsigned d=0;d<4;++d) {
+  const unsigned at=0x36+18*d;
+  if(edid[at] || edid[at+1] || edid[at+2] || edid[at+3]!=0xFD)continue;
+  minV=edid[at+5];maxV=edid[at+6];maxClock=edid[at+9];
+  bool changed=false;
+  if(edid[at+6]>60) {edid[at+6]=60;changed=true;}
+  if(edid[at+9]>65) {edid[at+9]=65;changed=true;}
+  if(changed) {
+   uint32_t sum=0;for(unsigned i=0;i<127;++i)sum+=edid[i];
+   edid[127]=uint8_t(-sum);
+  }
+  return changed;
+ }
+ return false;
+}
+// DisplayID 1.3 section: byte 0 is the 0x70 tag, byte 2 is the section length
+// minus five, bytes 5..7 the first data block header (tag 3, payload length at
+// byte 7) and the Type I detailed timings follow it. Turn that data block into
+// DisplayID padding (tag 0) with a zeroed payload, keep the section length,
+// then fix the section checksum at 0x7E and the EDID extension checksum at
+// 0x7F. Returns the payload size that was dropped, or 0 when the block does
+// not have that exact shape.
+inline uint32_t edidDropDisplayIDTimings(uint8_t *edid) {
+ if(!edid || edid[0]!=0x70 || edid[5]!=3 || !edid[7])return 0;
+ const unsigned length=edid[7];
+ if(length>40 || 8+length>126)return 0;
+ __builtin_memset(edid+5,0,3+length);
+ uint32_t section=0;for(unsigned i=1;i<126;++i)section+=edid[i];
+ edid[126]=uint8_t(-section);
+ uint32_t sum=0;for(unsigned i=0;i<127;++i)sum+=edid[i];
+ edid[127]=uint8_t(-sum);
+ return length;
+}
 }
 #endif
